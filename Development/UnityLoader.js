@@ -8,22 +8,58 @@ function LoadJSCodeBlob(blob, onload)
 
 function LoadJSCode(code, onload)
 {
-	var blob = new Blob([code], { type: 'text/javascript' });
-
-	// In Chrome, Math.fround is supported, but too slow and using too much AST memory when parsing.
-	if (!Math.fround || browser.indexOf("Chrome") != -1)
-	{
-		console.log('optimizing out Math.fround calls');
-		var f = new FileReader();
-		f.onload = function(e) {
-			var patchedcode = e.target.result.replace(/Math_fround\(/g, '(');
-			var patchedblob = new Blob([patchedcode], { type: 'text/javascript' });
-			LoadJSCodeBlob(patchedblob, onload);
-		}
-		f.readAsText(blob);
-	}
-	else
-		LoadJSCodeBlob(blob, onload);
+  // Math.fround opitimization is currently disabled for Chrome as it causes floating point related issues (i.e. in comparison operations involving both float and double)
+  if (!Math.fround) {
+    console.log('optimizing out Math.fround calls');
+    
+    var State = {
+      LOOKING_FOR_MODULE: 0,
+      SCANNING_MODULE_VARIABLES: 1,
+      SCANNING_MODULE_FUNCTIONS: 2,
+    };
+    var stateSwitchMarker = [
+      "EMSCRIPTEN_START_ASM",
+      "EMSCRIPTEN_START_FUNCS",
+      "EMSCRIPTEN_END_FUNCS",
+    ];
+    var froundPrefix = "var";
+    var froundMarker = "global.Math.fround;";
+    
+    var position = 0;
+    var state = State.LOOKING_FOR_MODULE;
+    var froundLast = 0;
+    var froundLength = 0;
+        
+    for(; state <= State.SCANNING_MODULE_FUNCTIONS && position < code.length; position++) {
+      if (code[position] == 0x2F && code[position + 1] == 0x2F && code[position + 2] == 0x20 &&
+          String.fromCharCode.apply(null, code.subarray(position + 3, position + 3 + stateSwitchMarker[state].length)) === stateSwitchMarker[state]) {
+        // if code at position starts with "// " + stateSwitchMarker[state]
+        state++;
+      } else if (state == State.SCANNING_MODULE_VARIABLES && !froundLength && code[position] == 0x3D &&
+          String.fromCharCode.apply(null, code.subarray(position + 1, position + 1 + froundMarker.length)) === froundMarker) {
+        // if we are at the module variable section and Math_fround name has not yet been found and code at position starts with "=" + froundMarker
+        froundLast = position - 1;
+        while(code[froundLast - froundLength] != 0x20)
+          froundLength++; // scan back until the first space character (it is always present as at least it is a part of the previously found "// ")
+        if (!froundLength || String.fromCharCode.apply(null, code.subarray(froundLast - froundLength - froundPrefix.length, froundLast - froundLength)) !== froundPrefix)
+          froundLast = froundLength = 0;
+      } else if (froundLength && code[position] == 0x28) {
+        // if Math_fround name has been found and code at position starts with "("
+        var nameLength = 0;
+        while (nameLength < froundLength && code[position - 1 - nameLength] == code[froundLast - nameLength])
+          nameLength++;
+        if (nameLength == froundLength) {
+          var c = code[position - 1 - nameLength];
+          if (c < 0x24 || (0x24 < c && c < 0x30) || (0x39 < c && c < 0x41) || (0x5A < c && c < 0x5F) || (0x5F < c && c < 0x61) || 0x7A < c) {
+            // if the matched Math_fround name is not a suffix of another identifier, i.e. it's preceding character does not match [$0-9A-Z_a-z]
+            for(;nameLength; nameLength--)
+              code[position - nameLength] = 0x20; // fill the Math_fround name with spaces (replacement works faster than shifting back the rest of the code)
+          }
+        }
+      }            
+    }
+  }
+  LoadJSCodeBlob(new Blob([code], { type: 'text/javascript' }), onload);
 }
 
 
@@ -50,7 +86,6 @@ CompressionState = {
 
 function DecompressAndLoadFile(url, onload, onprogress)
 {
-	tryServerCompression = false;
 	url += "gz";
 
 	var xhr = new XMLHttpRequest();
@@ -65,7 +100,16 @@ function DecompressAndLoadFile(url, onload, onprogress)
 		console.log ("Decompressed " + url + " in " + (end-start) + "ms. You can remove this delay if you configure your web server to host files using gzip compression.");
    		onload(decompressed);
 	};
-	// TODO: Handle XmlHttpRequest errors.
+	xhr.onerror = function() {
+		// Edge fails trying to download from file://...
+		console.log("Could not download " + url);
+
+		if (!didShowErrorMessage && document.URL.indexOf("file:") == 0)
+		{
+			alert ("It seems your browser does not support running Unity WebGL content from file:// urls. Please upload it to an http server, or try a different browser.");
+			didShowErrorMessage = true;
+		}		
+	}
 	xhr.send(null);
 }
 
@@ -182,13 +226,30 @@ function fetchRemotePackageWrapper (packageName, packageSize, callback, errback)
 }
 
 // Kick off actual loads.
-LoadCompressedJS(Module["codeUrl"]);
+function SetIndexedDBAndLoadCompressedJS(idb) {
+  if (SetIndexedDBAndLoadCompressedJS.called)
+    return;
+  SetIndexedDBAndLoadCompressedJS.called = true;
+  Module.indexedDB = idb;  
+  LoadCompressedJS(Module["codeUrl"]);
+}
+
+try {
+  var idb = window.indexedDB || window.mozIndexedDB || window.webkitIndexedDB || window.msIndexedDB;
+  var testRequest = idb.open("/idbfs-test");
+  testRequest.onerror = function(e) { e.preventDefault(); SetIndexedDBAndLoadCompressedJS(); }
+  testRequest.onsuccess = function() { testRequest.result.close(); SetIndexedDBAndLoadCompressedJS(idb); }
+  setTimeout(function() { SetIndexedDBAndLoadCompressedJS(); }, 1000);
+} catch (e) {
+  SetIndexedDBAndLoadCompressedJS();
+}
 
 LoadCompressedFile (Module["memUrl"], function(response) {
 	Module["memoryInitializerRequest"].response = response;
 	if (Module["memoryInitializerRequest"].callback)
 	  Module["memoryInitializerRequest"].callback();
 });
+
 
 
 /* pako 0.2.7 nodeca/pako */(function(f){if(typeof exports==="object"&&typeof module!=="undefined"){module.exports=f()}else if(typeof define==="function"&&define.amd){define([],f)}else{var g;if(typeof window!=="undefined"){g=window}else if(typeof global!=="undefined"){g=global}else if(typeof self!=="undefined"){g=self}else{g=this}g.pako = f()}})(function(){var define,module,exports;return (function e(t,n,r){function s(o,u){if(!n[o]){if(!t[o]){var a=typeof require=="function"&&require;if(!u&&a)return a(o,!0);if(i)return i(o,!0);var f=new Error("Cannot find module '"+o+"'");throw f.code="MODULE_NOT_FOUND",f}var l=n[o]={exports:{}};t[o][0].call(l.exports,function(e){var n=t[o][1][e];return s(n?n:e)},l,l.exports,e,t,n,r)}return n[o].exports}var i=typeof require=="function"&&require;for(var o=0;o<r.length;o++)s(r[o]);return s})({1:[function(require,module,exports){
@@ -3239,7 +3300,8 @@ exports.inflateRaw = inflateRaw;
 exports.ungzip  = inflate;
 
 },{"./utils/common":1,"./utils/strings":2,"./zlib/constants":4,"./zlib/gzheader":6,"./zlib/inflate.js":8,"./zlib/messages":10,"./zlib/zstream":11}]},{},[])("/lib/inflate.js")
-});// Identify user agent
+});
+// Identify user agent
 var browser = (function(){
     var ua= navigator.userAgent, tem, 
     M= ua.match(/(opera|chrome|safari|firefox|msie|trident(?=\/))\/?\s*(\d+)/i) || [];
@@ -3283,7 +3345,7 @@ var hasWebGL = (function(){
 
 // Check for mobile browsers
 var mobile = (function(a){
-    return (/(android|bb\d+|meego).+mobile|avantgo|bada\/|blackberry|blazer|compal|elaine|fennec|hiptop|iemobile|ip(hone|od)|iris|kindle|lge |maemo|midp|mmp|mobile.+firefox|netfront|opera m(ob|in)i|palm( os)?|phone|p(ixi|re)\/|plucker|pocket|psp|series(4|6)0|symbian|treo|up\.(browser|link)|vodafone|wap|windows (ce|phone)|xda|xiino/i.test(a)||/1207|6310|6590|3gso|4thp|50[1-6]i|770s|802s|a wa|abac|ac(er|oo|s\-)|ai(ko|rn)|al(av|ca|co)|amoi|an(ex|ny|yw)|aptu|ar(ch|go)|as(te|us)|attw|au(di|\-m|r |s )|avan|be(ck|ll|nq)|bi(lb|rd)|bl(ac|az)|br(e|v)w|bumb|bw\-(n|u)|c55\/|capi|ccwa|cdm\-|cell|chtm|cldc|cmd\-|co(mp|nd)|craw|da(it|ll|ng)|dbte|dc\-s|devi|dica|dmob|do(c|p)o|ds(12|\-d)|el(49|ai)|em(l2|ul)|er(ic|k0)|esl8|ez([4-7]0|os|wa|ze)|fetc|fly(\-|_)|g1 u|g560|gene|gf\-5|g\-mo|go(\.w|od)|gr(ad|un)|haie|hcit|hd\-(m|p|t)|hei\-|hi(pt|ta)|hp( i|ip)|hs\-c|ht(c(\-| |_|a|g|p|s|t)|tp)|hu(aw|tc)|i\-(20|go|ma)|i230|iac( |\-|\/)|ibro|idea|ig01|ikom|im1k|inno|ipaq|iris|ja(t|v)a|jbro|jemu|jigs|kddi|keji|kgt( |\/)|klon|kpt |kwc\-|kyo(c|k)|le(no|xi)|lg( g|\/(k|l|u)|50|54|\-[a-w])|libw|lynx|m1\-w|m3ga|m50\/|ma(te|ui|xo)|mc(01|21|ca)|m\-cr|me(rc|ri)|mi(o8|oa|ts)|mmef|mo(01|02|bi|de|do|t(\-| |o|v)|zz)|mt(50|p1|v )|mwbp|mywa|n10[0-2]|n20[2-3]|n30(0|2)|n50(0|2|5)|n7(0(0|1)|10)|ne((c|m)\-|on|tf|wf|wg|wt)|nok(6|i)|nzph|o2im|op(ti|wv)|oran|owg1|p800|pan(a|d|t)|pdxg|pg(13|\-([1-8]|c))|phil|pire|pl(ay|uc)|pn\-2|po(ck|rt|se)|prox|psio|pt\-g|qa\-a|qc(07|12|21|32|60|\-[2-7]|i\-)|qtek|r380|r600|raks|rim9|ro(ve|zo)|s55\/|sa(ge|ma|mm|ms|ny|va)|sc(01|h\-|oo|p\-)|sdk\/|se(c(\-|0|1)|47|mc|nd|ri)|sgh\-|shar|sie(\-|m)|sk\-0|sl(45|id)|sm(al|ar|b3|it|t5)|so(ft|ny)|sp(01|h\-|v\-|v )|sy(01|mb)|t2(18|50)|t6(00|10|18)|ta(gt|lk)|tcl\-|tdg\-|tel(i|m)|tim\-|t\-mo|to(pl|sh)|ts(70|m\-|m3|m5)|tx\-9|up(\.b|g1|si)|utst|v400|v750|veri|vi(rg|te)|vk(40|5[0-3]|\-v)|vm40|voda|vulc|vx(52|53|60|61|70|80|81|83|85|98)|w3c(\-| )|webc|whit|wi(g |nc|nw)|wmlb|wonu|x700|yas\-|your|zeto|zte\-/i.test(a.substr(0,4)))
+    return (/(android|bb\d+|meego).+mobile|avantgo|bada\/|blazer|compal|elaine|fennec|hiptop|iemobile|ip(hone|od)|iris|kindle|lge |maemo|midp|mmp|mobile.+firefox|netfront|opera m(ob|in)i|palm( os)?|phone|p(ixi|re)\/|plucker|pocket|psp|series(4|6)0|symbian|treo|up\.(browser|link)|vodafone|wap|windows (ce|phone)|xda|xiino/i.test(a)||/1207|6310|6590|3gso|4thp|50[1-6]i|770s|802s|a wa|abac|ac(er|oo|s\-)|ai(ko|rn)|al(av|ca|co)|amoi|an(ex|ny|yw)|aptu|ar(ch|go)|as(te|us)|attw|au(di|\-m|r |s )|avan|be(ck|ll|nq)|bi(lb|rd)|bl(ac|az)|br(e|v)w|bumb|bw\-(n|u)|c55\/|capi|ccwa|cdm\-|cell|chtm|cldc|cmd\-|co(mp|nd)|craw|da(it|ll|ng)|dbte|dc\-s|devi|dica|dmob|do(c|p)o|ds(12|\-d)|el(49|ai)|em(l2|ul)|er(ic|k0)|esl8|ez([4-7]0|os|wa|ze)|fetc|fly(\-|_)|g1 u|g560|gene|gf\-5|g\-mo|go(\.w|od)|gr(ad|un)|haie|hcit|hd\-(m|p|t)|hei\-|hi(pt|ta)|hp( i|ip)|hs\-c|ht(c(\-| |_|a|g|p|s|t)|tp)|hu(aw|tc)|i\-(20|go|ma)|i230|iac( |\-|\/)|ibro|idea|ig01|ikom|im1k|inno|ipaq|iris|ja(t|v)a|jbro|jemu|jigs|kddi|keji|kgt( |\/)|klon|kpt |kwc\-|kyo(c|k)|le(no|xi)|lg( g|\/(k|l|u)|50|54|\-[a-w])|libw|lynx|m1\-w|m3ga|m50\/|ma(te|ui|xo)|mc(01|21|ca)|m\-cr|me(rc|ri)|mi(o8|oa|ts)|mmef|mo(01|02|bi|de|do|t(\-| |o|v)|zz)|mt(50|p1|v )|mwbp|mywa|n10[0-2]|n20[2-3]|n30(0|2)|n50(0|2|5)|n7(0(0|1)|10)|ne((c|m)\-|on|tf|wf|wg|wt)|nok(6|i)|nzph|o2im|op(ti|wv)|oran|owg1|p800|pan(a|d|t)|pdxg|pg(13|\-([1-8]|c))|phil|pire|pl(ay|uc)|pn\-2|po(ck|rt|se)|prox|psio|pt\-g|qa\-a|qc(07|12|21|32|60|\-[2-7]|i\-)|qtek|r380|r600|raks|rim9|ro(ve|zo)|s55\/|sa(ge|ma|mm|ms|ny|va)|sc(01|h\-|oo|p\-)|sdk\/|se(c(\-|0|1)|47|mc|nd|ri)|sgh\-|shar|sie(\-|m)|sk\-0|sl(45|id)|sm(al|ar|b3|it|t5)|so(ft|ny)|sp(01|h\-|v\-|v )|sy(01|mb)|t2(18|50)|t6(00|10|18)|ta(gt|lk)|tcl\-|tdg\-|tel(i|m)|tim\-|t\-mo|to(pl|sh)|ts(70|m\-|m3|m5)|tx\-9|up(\.b|g1|si)|utst|v400|v750|veri|vi(rg|te)|vk(40|5[0-3]|\-v)|vm40|voda|vulc|vx(52|53|60|61|70|80|81|83|85|98)|w3c(\-| )|webc|whit|wi(g |nc|nw)|wmlb|wonu|x700|yas\-|your|zeto|zte\-/i.test(a.substr(0,4)))
 })(navigator.userAgent||navigator.vendor||window.opera);
 
 function CompatibilityCheck()
@@ -3349,16 +3411,11 @@ if (typeof window.onerror != 'function')
             alert ("Out of memory. If you are the developer of this content, try allocating more memory to your WebGL build in the WebGL player settings.");
             return;        
         }
-        if (err.indexOf("Invalid array buffer length") != -1 || err.indexOf("out of memory") != -1 )
+        if (err.indexOf("Invalid array buffer length") != -1  || err.indexOf("Invalid typed array length") != -1 || err.indexOf("out of memory") != -1)
         {
             alert ("The browser could not allocate enough memory for the WebGL content. If you are the developer of this content, try allocating less memory to your WebGL build in the WebGL player settings.");
             return;                
         }
-        if (err.indexOf("Script error.") != -1 && document.URL.indexOf("file:") == 0)
-        {
-            alert ("It seems your browser does not support running Unity WebGL content from file:// urls. Please upload it to an http server, or try a different browser.");
-            return;
-        } 
         alert ("An error occured running the Unity content on this page. See your browser's JavaScript console for more info. The error was:\n"+err);
     }
 }
@@ -3374,7 +3431,8 @@ function SetFullscreen(fullscreen)
     JSEvents.canPerformEventHandlerRequests = function(){return 1;};
     Module.cwrap('SetFullscreen', 'void', ['number'])(fullscreen);
     JSEvents.canPerformEventHandlerRequests = tmp;
-}Module.locateFile = function(remotePackageBase) { return Module.dataUrl; };
+}
+Module.locateFile = function(remotePackageBase) { return Module.dataUrl; };
 Module.preRun = [];
 Module.postRun = [];
 Module.print = (function() {
@@ -3409,6 +3467,7 @@ Module.monitorRunDependencies = function(left) {
   Module.setStatus(left ? 'Preparing... (' + (this.totalDependencies-left) + '/' + this.totalDependencies + ')' : 'All downloads complete.');
 };
 Module.setStatus('Downloading (0.0/1)');
+
 var Module;
 
 if (typeof Module === 'undefined') Module = eval('(function() { try { return Module || {} } catch(e) { return {} } })()');
@@ -3440,8 +3499,8 @@ Module.expectedDataFileDownloads++;
                               Module['locateFile'](REMOTE_PACKAGE_BASE) :
                               ((Module['filePackagePrefixURL'] || '') + REMOTE_PACKAGE_BASE);
   
-      var REMOTE_PACKAGE_SIZE = 4609950;
-      var PACKAGE_UUID = 'ddf1a83f-3918-4220-bead-ecbf201b0a53';
+      var REMOTE_PACKAGE_SIZE = 2501386;
+      var PACKAGE_UUID = 'edf1e06f-76d3-4af7-8d01-ac2336136ac9';
     
     function fetchRemotePackage(packageName, packageSize, callback, errback) {
       var xhr = new XMLHttpRequest();
@@ -3545,16 +3604,12 @@ Module['FS_createPath']('/Managed/mono', '2.0', true, true);
       },
     };
 
-      new DataRequest(0, 20268, 0, 0).open('GET', '/globalgamemanagers');
-    new DataRequest(20268, 31196, 0, 0).open('GET', '/globalgamemanagers.assets');
-    new DataRequest(31196, 39768, 0, 0).open('GET', '/level0');
-    new DataRequest(39768, 39789, 0, 0).open('GET', '/methods_pointedto_by_uievents.xml');
-    new DataRequest(39789, 39917, 0, 0).open('GET', '/preserved_derived_types.xml');
-    new DataRequest(39917, 1629553, 0, 0).open('GET', '/sharedassets0.assets');
-    new DataRequest(1629553, 3024225, 0, 0).open('GET', '/Il2CppData/Metadata/global-metadata.dat');
-    new DataRequest(3024225, 4521597, 0, 0).open('GET', '/Resources/unity_default_resources');
-    new DataRequest(4521597, 4582325, 0, 0).open('GET', '/Resources/unity_builtin_extra');
-    new DataRequest(4582325, 4609950, 0, 0).open('GET', '/Managed/mono/2.0/machine.config');
+      new DataRequest(0, 141604, 0, 0).open('GET', '/data.unity3d');
+    new DataRequest(141604, 141625, 0, 0).open('GET', '/methods_pointedto_by_uievents.xml');
+    new DataRequest(141625, 141753, 0, 0).open('GET', '/preserved_derived_types.xml');
+    new DataRequest(141753, 1598789, 0, 0).open('GET', '/Il2CppData/Metadata/global-metadata.dat');
+    new DataRequest(1598789, 2473761, 0, 0).open('GET', '/Resources/unity_default_resources');
+    new DataRequest(2473761, 2501386, 0, 0).open('GET', '/Managed/mono/2.0/machine.config');
 
     function processPackageData(arrayBuffer) {
       Module.finishedDataFileDownloads++;
@@ -3564,15 +3619,11 @@ Module['FS_createPath']('/Managed/mono', '2.0', true, true);
       
       // Reuse the bytearray from the XHR as the source for file reads.
       DataRequest.prototype.byteArray = byteArray;
-          DataRequest.prototype.requests["/globalgamemanagers"].onload();
-          DataRequest.prototype.requests["/globalgamemanagers.assets"].onload();
-          DataRequest.prototype.requests["/level0"].onload();
+          DataRequest.prototype.requests["/data.unity3d"].onload();
           DataRequest.prototype.requests["/methods_pointedto_by_uievents.xml"].onload();
           DataRequest.prototype.requests["/preserved_derived_types.xml"].onload();
-          DataRequest.prototype.requests["/sharedassets0.assets"].onload();
           DataRequest.prototype.requests["/Il2CppData/Metadata/global-metadata.dat"].onload();
           DataRequest.prototype.requests["/Resources/unity_default_resources"].onload();
-          DataRequest.prototype.requests["/Resources/unity_builtin_extra"].onload();
           DataRequest.prototype.requests["/Managed/mono/2.0/machine.config"].onload();
           Module['removeRunDependency']('datafile_yunatan.github.com.data');
 
